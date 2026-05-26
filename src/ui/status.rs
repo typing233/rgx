@@ -49,7 +49,7 @@ impl<'a> Widget for StatusBar<'a> {
             ),
             Span::raw(" │ "),
             Span::styled(
-                "Tab:focus Ctrl+E:engine Alt+I/M/S/U/X:flags Esc:quit",
+                "Tab:focus C-e:engine C-d:debug C-g:code C-z/y:undo/redo C-c:copy Esc:quit",
                 Style::default().fg(Color::DarkGray),
             ),
         ];
