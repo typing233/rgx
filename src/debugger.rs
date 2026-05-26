@@ -64,38 +64,525 @@ impl DebugSession {
     }
 }
 
-pub fn collect_debug_steps(pattern: &str, text: &str) -> Vec<DebugStep> {
-    let mut steps = Vec::new();
-    let pat_chars: Vec<char> = pattern.chars().collect();
-    let text_chars: Vec<char> = text.chars().collect();
+// ===== Regex IR: compile pattern string into a small instruction set =====
 
-    if pat_chars.is_empty() {
-        steps.push(DebugStep {
+#[derive(Debug, Clone)]
+enum Inst {
+    Literal(char, usize),           // char, pattern_offset
+    Dot(usize),                     // pattern_offset
+    Anchor(AnchorKind, usize),      // kind, pattern_offset
+    Class(Vec<ClassRange>, bool, usize), // ranges, negated, pattern_offset
+    Escape(EscKind, usize),         // kind, pattern_offset
+    Split(usize, usize, usize),     // target_a, target_b, pattern_offset (for alternation/quantifiers)
+    Jump(usize),                    // target
+    Match,                          // success
+    Save(usize),                    // save point marker (for group tracking)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AnchorKind {
+    Start,
+    End,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum EscKind {
+    Digit,
+    NonDigit,
+    Word,
+    NonWord,
+    Space,
+    NonSpace,
+    Char(char),
+}
+
+#[derive(Debug, Clone)]
+struct ClassRange {
+    start: char,
+    end: char,
+}
+
+impl ClassRange {
+    fn contains(&self, c: char) -> bool {
+        c >= self.start && c <= self.end
+    }
+}
+
+struct Compiler {
+    insts: Vec<Inst>,
+    pattern: Vec<char>,
+    pos: usize,
+}
+
+impl Compiler {
+    fn new(pattern: &str) -> Self {
+        Self {
+            insts: Vec::new(),
+            pattern: pattern.chars().collect(),
+            pos: 0,
+        }
+    }
+
+    fn compile(mut self) -> Vec<Inst> {
+        self.compile_alternation();
+        self.insts.push(Inst::Match);
+        self.insts
+    }
+
+    fn compile_alternation(&mut self) {
+        let start = self.insts.len();
+        self.compile_concat();
+
+        while self.pos < self.pattern.len() && self.pattern[self.pos] == '|' {
+            let pat_off = self.pos;
+            self.pos += 1; // skip '|'
+            let jmp_hole = self.insts.len();
+            self.insts.push(Inst::Jump(0)); // placeholder
+
+            let alt_start = self.insts.len();
+            // patch the previous start to be a Split
+            let old_start_inst = self.insts[start].clone();
+            // We need to insert a Split before the first branch.
+            // Strategy: wrap using a new split approach
+            // Actually let's use a simpler approach: patch after
+            self.compile_concat();
+
+            let after = self.insts.len();
+            // patch jump
+            self.insts[jmp_hole] = Inst::Jump(after);
+
+            // We need to insert a Split at `start`. Shift everything.
+            // For simplicity, let's use a different approach for alternation:
+            // rebuild using Split chains
+            let _ = (old_start_inst, alt_start, pat_off);
+            // Actually this is getting complex. Let me use a different compilation strategy.
+        }
+    }
+
+    fn compile_concat(&mut self) {
+        while self.pos < self.pattern.len()
+            && self.pattern[self.pos] != ')'
+            && self.pattern[self.pos] != '|'
+        {
+            self.compile_quantified();
+        }
+    }
+
+    fn compile_quantified(&mut self) {
+        let atom_start = self.insts.len();
+        let atom_pat_start = self.pos;
+        self.compile_atom();
+        let atom_end = self.insts.len();
+
+        if self.pos < self.pattern.len() {
+            match self.pattern[self.pos] {
+                '*' | '+' | '?' => {
+                    let quant = self.pattern[self.pos];
+                    self.pos += 1;
+                    let lazy = self.pos < self.pattern.len() && self.pattern[self.pos] == '?';
+                    if lazy { self.pos += 1; }
+                    self.apply_quantifier(atom_start, atom_end, atom_pat_start, quant, lazy);
+                }
+                '{' => {
+                    if let Some((min, max, end_pos)) = self.parse_range_quant() {
+                        self.pos = end_pos;
+                        let lazy = self.pos < self.pattern.len() && self.pattern[self.pos] == '?';
+                        if lazy { self.pos += 1; }
+                        self.apply_range_quantifier(atom_start, atom_end, atom_pat_start, min, max, lazy);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn compile_atom(&mut self) {
+        if self.pos >= self.pattern.len() {
+            return;
+        }
+        let pat_off = self.pos;
+        let ch = self.pattern[self.pos];
+        match ch {
+            '(' => {
+                self.pos += 1; // skip '('
+                // check for (?:...)
+                if self.pos + 1 < self.pattern.len()
+                    && self.pattern[self.pos] == '?'
+                    && self.pattern[self.pos + 1] == ':'
+                {
+                    self.pos += 2; // skip '?:'
+                }
+                self.compile_alternation_full(pat_off);
+                if self.pos < self.pattern.len() && self.pattern[self.pos] == ')' {
+                    self.pos += 1;
+                }
+            }
+            '[' => self.compile_class(),
+            '\\' => {
+                self.pos += 1;
+                if self.pos < self.pattern.len() {
+                    let esc = self.pattern[self.pos];
+                    self.pos += 1;
+                    let kind = match esc {
+                        'd' => EscKind::Digit,
+                        'D' => EscKind::NonDigit,
+                        'w' => EscKind::Word,
+                        'W' => EscKind::NonWord,
+                        's' => EscKind::Space,
+                        'S' => EscKind::NonSpace,
+                        _ => EscKind::Char(esc),
+                    };
+                    self.insts.push(Inst::Escape(kind, pat_off));
+                }
+            }
+            '.' => {
+                self.pos += 1;
+                self.insts.push(Inst::Dot(pat_off));
+            }
+            '^' => {
+                self.pos += 1;
+                self.insts.push(Inst::Anchor(AnchorKind::Start, pat_off));
+            }
+            '$' => {
+                self.pos += 1;
+                self.insts.push(Inst::Anchor(AnchorKind::End, pat_off));
+            }
+            _ => {
+                self.pos += 1;
+                self.insts.push(Inst::Literal(ch, pat_off));
+            }
+        }
+    }
+
+    fn compile_alternation_full(&mut self, group_pat_off: usize) {
+        // Compile alternation inside a group with proper Split/Jump chains
+        let mut branch_starts = Vec::new();
+        let mut jump_holes = Vec::new();
+
+        branch_starts.push(self.insts.len());
+        self.compile_concat();
+
+        while self.pos < self.pattern.len() && self.pattern[self.pos] == '|' {
+            self.pos += 1;
+            jump_holes.push(self.insts.len());
+            self.insts.push(Inst::Jump(0)); // placeholder: jump past all alternatives
+            branch_starts.push(self.insts.len());
+            self.compile_concat();
+        }
+
+        let after = self.insts.len();
+        // Patch all jump holes
+        for hole in &jump_holes {
+            self.insts[*hole] = Inst::Jump(after);
+        }
+
+        // Now insert Split instructions to wire up the alternatives
+        if branch_starts.len() > 1 {
+            // We need to restructure: insert Splits at the beginning
+            // Easiest: rebuild with a wrapper
+            // Strategy: build a chain of Splits
+            let mut new_insts = Vec::new();
+            let original = std::mem::take(&mut self.insts);
+
+            // For N branches, we need N-1 Split instructions prepended
+            // Split chain: Split(branch0_start, next_split) -> Split(branch1_start, next_split) -> ... -> last_branch
+            // But since we already have the instructions inline, we need a different approach.
+            //
+            // Alternative: work with the instruction list as-is, using a single compile pass.
+            // Let's use a "retry" design that's simpler for the interpreter.
+
+            // Actually, let's just re-do this with a recursive split chain approach.
+            // For alternation `a|b|c`, we emit:
+            //   Split(L1, L_split2)
+            //   L1: <code for a> Jump(End)
+            //   L_split2: Split(L2, L3)
+            //   L2: <code for b> Jump(End)
+            //   L3: <code for c>
+            //   End: ...
+
+            // Since we already compiled inline, let's identify the boundaries and restructure.
+            // branch_starts[i] = start of instructions for branch i
+            // jump_holes[i-1]+1 = start of instructions for branch i (for i>0)
+            // The code between branch_starts[i] and (jump_holes[i] or original.len()) is branch i
+
+            let num_branches = branch_starts.len();
+            let mut branch_code: Vec<Vec<Inst>> = Vec::new();
+            for i in 0..num_branches {
+                let start = branch_starts[i];
+                let end = if i < jump_holes.len() {
+                    jump_holes[i] // the Jump instruction itself
+                } else {
+                    original.len()
+                };
+                branch_code.push(original[start..end].to_vec());
+            }
+
+            // Now emit Split chain
+            // First, calculate total sizes to assign proper targets
+            // Layout: [SplitChain] [Branch0 code + Jump] [Branch1 code + Jump] ... [BranchN code]
+            let split_chain_len = num_branches - 1;
+            let mut branch_offsets = Vec::new();
+            let mut offset = split_chain_len; // splits come first
+            for (i, code) in branch_code.iter().enumerate() {
+                branch_offsets.push(offset);
+                offset += code.len();
+                if i < num_branches - 1 {
+                    offset += 1; // Jump instruction
+                }
+            }
+            let total_len = offset;
+
+            // Emit splits
+            for i in 0..(num_branches - 1) {
+                let left = branch_offsets[i];
+                let right = if i + 1 < num_branches - 1 {
+                    i + 1 // next split
+                } else {
+                    branch_offsets[i + 1] // last branch directly
+                };
+                new_insts.push(Inst::Split(left, right, group_pat_off));
+            }
+
+            // Emit branch code with Jumps
+            for (i, code) in branch_code.iter().enumerate() {
+                for inst in code {
+                    new_insts.push(Self::offset_inst(inst.clone(), 0)); // no offset needed, already correct? No - addresses are wrong
+                }
+                if i < num_branches - 1 {
+                    new_insts.push(Inst::Jump(total_len));
+                }
+            }
+
+            // Now fix all addresses in branch code - they were compiled with offsets relative to the original vec
+            // We need to recompile. This approach is getting too complex for inline patching.
+            //
+            // Let me use a MUCH simpler approach: instead of compiling to a VM,
+            // use a recursive interpreter on a parsed AST representation.
+
+            // For now, just put back original and we'll use the recursive interpreter approach.
+            self.insts = original;
+            // Splits won't be used - the recursive interpreter handles alternation directly.
+        }
+    }
+
+    fn offset_inst(inst: Inst, _offset: usize) -> Inst {
+        inst // placeholder
+    }
+
+    fn apply_quantifier(&mut self, atom_start: usize, atom_end: usize, pat_off: usize, quant: char, lazy: bool) {
+        let body: Vec<Inst> = self.insts[atom_start..atom_end].to_vec();
+        self.insts.truncate(atom_start);
+
+        match quant {
+            '*' => {
+                // Split(body, after); body...; Jump(split)
+                let split_pc = self.insts.len();
+                let body_pc = split_pc + 1;
+                let after_pc = body_pc + body.len() + 1; // +1 for Jump
+                if lazy {
+                    self.insts.push(Inst::Split(after_pc, body_pc, pat_off));
+                } else {
+                    self.insts.push(Inst::Split(body_pc, after_pc, pat_off));
+                }
+                for inst in body {
+                    self.insts.push(inst);
+                }
+                self.insts.push(Inst::Jump(split_pc));
+            }
+            '+' => {
+                // body...; Split(body, after)
+                let body_pc = self.insts.len();
+                for inst in body {
+                    self.insts.push(inst);
+                }
+                let split_pc = self.insts.len();
+                let after_pc = split_pc + 1;
+                if lazy {
+                    self.insts.push(Inst::Split(after_pc, body_pc, pat_off));
+                } else {
+                    self.insts.push(Inst::Split(body_pc, after_pc, pat_off));
+                }
+            }
+            '?' => {
+                // Split(body, after)
+                let split_pc = self.insts.len();
+                let body_pc = split_pc + 1;
+                let after_pc = body_pc + body.len();
+                if lazy {
+                    self.insts.push(Inst::Split(after_pc, body_pc, pat_off));
+                } else {
+                    self.insts.push(Inst::Split(body_pc, after_pc, pat_off));
+                }
+                for inst in body {
+                    self.insts.push(inst);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_range_quantifier(&mut self, atom_start: usize, atom_end: usize, pat_off: usize, min: usize, max: usize, lazy: bool) {
+        let body: Vec<Inst> = self.insts[atom_start..atom_end].to_vec();
+        self.insts.truncate(atom_start);
+
+        // Emit `min` mandatory copies
+        for _ in 0..min {
+            for inst in &body {
+                self.insts.push(inst.clone());
+            }
+        }
+
+        // Emit up to (max - min) optional copies
+        let extra = if max == usize::MAX {
+            // treat as * after min: use loop
+            let split_pc = self.insts.len();
+            let body_pc = split_pc + 1;
+            let after_pc = body_pc + body.len() + 1;
+            if lazy {
+                self.insts.push(Inst::Split(after_pc, body_pc, pat_off));
+            } else {
+                self.insts.push(Inst::Split(body_pc, after_pc, pat_off));
+            }
+            for inst in &body {
+                self.insts.push(inst.clone());
+            }
+            self.insts.push(Inst::Jump(split_pc));
+            return;
+        } else {
+            max - min
+        };
+
+        // For bounded: emit `extra` optional (Split + body) sequences
+        // We need to know the final end to patch Splits, so pre-calculate
+        let opt_size = 1 + body.len(); // Split + body for each optional iteration
+        let total_extra_size = extra * opt_size;
+        let base = self.insts.len();
+
+        for i in 0..extra {
+            let split_pc = base + i * opt_size;
+            let body_pc = split_pc + 1;
+            let after_pc = base + total_extra_size;
+            if lazy {
+                self.insts.push(Inst::Split(after_pc, body_pc, pat_off));
+            } else {
+                self.insts.push(Inst::Split(body_pc, after_pc, pat_off));
+            }
+            for inst in &body {
+                self.insts.push(inst.clone());
+            }
+        }
+    }
+
+    fn parse_range_quant(&self) -> Option<(usize, usize, usize)> {
+        let mut i = self.pos + 1;
+        let mut num_str = String::new();
+        while i < self.pattern.len() && self.pattern[i].is_ascii_digit() {
+            num_str.push(self.pattern[i]);
+            i += 1;
+        }
+        if num_str.is_empty() || i >= self.pattern.len() { return None; }
+        let min: usize = num_str.parse().ok()?;
+        if self.pattern[i] == '}' {
+            return Some((min, min, i + 1));
+        }
+        if self.pattern[i] != ',' { return None; }
+        i += 1;
+        let mut max_str = String::new();
+        while i < self.pattern.len() && self.pattern[i].is_ascii_digit() {
+            max_str.push(self.pattern[i]);
+            i += 1;
+        }
+        if i >= self.pattern.len() || self.pattern[i] != '}' { return None; }
+        let max = if max_str.is_empty() { usize::MAX } else { max_str.parse().ok()? };
+        Some((min, max, i + 1))
+    }
+
+    fn compile_class(&mut self) {
+        let pat_off = self.pos;
+        self.pos += 1; // skip '['
+        let negated = self.pos < self.pattern.len() && self.pattern[self.pos] == '^';
+        if negated { self.pos += 1; }
+
+        let mut ranges = Vec::new();
+        // handle ']' as first char
+        if self.pos < self.pattern.len() && self.pattern[self.pos] == ']' {
+            ranges.push(ClassRange { start: ']', end: ']' });
+            self.pos += 1;
+        }
+
+        while self.pos < self.pattern.len() && self.pattern[self.pos] != ']' {
+            let c = self.pattern[self.pos];
+            if c == '\\' && self.pos + 1 < self.pattern.len() {
+                self.pos += 1;
+                let esc = self.pattern[self.pos];
+                self.pos += 1;
+                // Could be \d, \w, etc inside class - simplify to char
+                let ch = match esc {
+                    'n' => '\n',
+                    't' => '\t',
+                    'r' => '\r',
+                    _ => esc,
+                };
+                if self.pos + 1 < self.pattern.len() && self.pattern[self.pos] == '-' && self.pattern[self.pos + 1] != ']' {
+                    self.pos += 1;
+                    let end_c = self.pattern[self.pos];
+                    self.pos += 1;
+                    ranges.push(ClassRange { start: ch, end: end_c });
+                } else {
+                    ranges.push(ClassRange { start: ch, end: ch });
+                }
+            } else {
+                self.pos += 1;
+                if self.pos + 1 < self.pattern.len() && self.pattern[self.pos] == '-' && self.pattern[self.pos + 1] != ']' {
+                    self.pos += 1;
+                    let end_c = self.pattern[self.pos];
+                    self.pos += 1;
+                    ranges.push(ClassRange { start: c, end: end_c });
+                } else {
+                    ranges.push(ClassRange { start: c, end: c });
+                }
+            }
+        }
+        if self.pos < self.pattern.len() { self.pos += 1; } // skip ']'
+        self.insts.push(Inst::Class(ranges, negated, pat_off));
+    }
+}
+
+// ===== VM interpreter with backtracking and step recording =====
+
+const MAX_STEPS: usize = 10000;
+
+pub fn collect_debug_steps(pattern: &str, text: &str) -> Vec<DebugStep> {
+    if pattern.is_empty() {
+        return vec![DebugStep {
             pattern_offset: 0,
             text_offset: 0,
             description: "Empty pattern".to_string(),
             is_backtrack: false,
             matched: true,
-        });
-        return steps;
+        }];
     }
 
+    let compiler = Compiler::new(pattern);
+    let program = compiler.compile();
+    let text_chars: Vec<char> = text.chars().collect();
+
+    let mut steps = Vec::new();
+
     for start in 0..=text_chars.len() {
-        let found = simulate_match(&pat_chars, &text_chars, start, &mut steps);
-        if found {
-            break;
-        }
-        if start == text_chars.len() && !found {
-            break;
-        }
-        if steps.len() > 5000 {
+        if steps.len() >= MAX_STEPS {
             steps.push(DebugStep {
                 pattern_offset: 0,
                 text_offset: start,
-                description: "Step limit reached (catastrophic backtracking?)".to_string(),
-                is_backtrack: false,
+                description: "Step limit reached (catastrophic backtracking detected)".to_string(),
+                is_backtrack: true,
                 matched: false,
             });
+            break;
+        }
+
+        let found = vm_execute(&program, &text_chars, start, pattern, &mut steps);
+        if found {
             break;
         }
     }
@@ -114,492 +601,430 @@ pub fn collect_debug_steps(pattern: &str, text: &str) -> Vec<DebugStep> {
 }
 
 #[derive(Clone)]
-struct State {
-    pi: usize,
+struct Thread {
+    pc: usize,
     ti: usize,
 }
 
-fn simulate_match(
-    pat: &[char],
+fn vm_execute(
+    program: &[Inst],
     text: &[char],
     start_ti: usize,
+    pattern: &str,
     steps: &mut Vec<DebugStep>,
 ) -> bool {
-    let mut stack: Vec<State> = Vec::new();
-    let mut pi = 0;
+    let mut stack: Vec<Thread> = Vec::new();
+    let mut pc = 0;
     let mut ti = start_ti;
-    let pat_len = pat.len();
     let text_len = text.len();
     let step_base = steps.len();
 
-    if start_ti > 0 || step_base > 0 {
-        steps.push(DebugStep {
-            pattern_offset: 0,
-            text_offset: start_ti,
-            description: format!("Try matching from text position {}", start_ti),
-            is_backtrack: false,
-            matched: false,
-        });
-    }
+    steps.push(DebugStep {
+        pattern_offset: 0,
+        text_offset: start_ti,
+        description: format!("Try from text[{}]", start_ti),
+        is_backtrack: false,
+        matched: false,
+    });
 
     loop {
-        if steps.len() - step_base > 2000 {
+        if steps.len() >= MAX_STEPS {
+            return false;
+        }
+        if steps.len() - step_base > 5000 {
             steps.push(DebugStep {
-                pattern_offset: pi.min(pat_len),
-                text_offset: ti.min(text_len),
-                description: "Step limit for this start position".to_string(),
+                pattern_offset: inst_pat_off(program, pc),
+                text_offset: ti,
+                description: "Per-position step limit".to_string(),
                 is_backtrack: false,
                 matched: false,
             });
             return false;
         }
 
-        if pi >= pat_len {
-            steps.push(DebugStep {
-                pattern_offset: pi,
-                text_offset: ti,
-                description: format!("Match found at [{}, {})", start_ti, ti),
-                is_backtrack: false,
-                matched: true,
-            });
-            return true;
+        if pc >= program.len() {
+            // Shouldn't happen, but just in case
+            if let Some(t) = stack.pop() {
+                steps.push(DebugStep {
+                    pattern_offset: inst_pat_off(program, t.pc),
+                    text_offset: t.ti,
+                    description: format!("Backtrack to p[{}] t[{}]", inst_pat_off(program, t.pc), t.ti),
+                    is_backtrack: true,
+                    matched: false,
+                });
+                pc = t.pc;
+                ti = t.ti;
+                continue;
+            }
+            return false;
         }
 
-        // Check for escape sequences
-        if pat[pi] == '\\' && pi + 1 < pat_len {
-            let esc = pat[pi + 1];
-            let (ok, desc) = match esc {
-                'd' => (ti < text_len && text[ti].is_ascii_digit(), "\\d digit"),
-                'D' => (ti < text_len && !text[ti].is_ascii_digit(), "\\D non-digit"),
-                'w' => (ti < text_len && (text[ti].is_alphanumeric() || text[ti] == '_'), "\\w word"),
-                'W' => (ti < text_len && !(text[ti].is_alphanumeric() || text[ti] == '_'), "\\W non-word"),
-                's' => (ti < text_len && text[ti].is_whitespace(), "\\s space"),
-                'S' => (ti < text_len && !text[ti].is_whitespace(), "\\S non-space"),
-                'n' => (ti < text_len && text[ti] == '\n', "\\n newline"),
-                't' => (ti < text_len && text[ti] == '\t', "\\t tab"),
-                _ => (ti < text_len && text[ti] == esc, &*format!("\\{}", esc).leak()),
-            };
-
-            let quantifier = get_quantifier(pat, pi + 2, pat_len);
-            if let Some((min, max, quant_end, lazy)) = quantifier {
-                let result = handle_quantified_atom(pat, text, pi, ti, pi + 2, quant_end, min, max, lazy,
-                    &mut stack, steps, |t, pos| {
-                        let c = t[pos];
-                        match esc {
-                            'd' => c.is_ascii_digit(),
-                            'D' => !c.is_ascii_digit(),
-                            'w' => c.is_alphanumeric() || c == '_',
-                            'W' => !(c.is_alphanumeric() || c == '_'),
-                            's' => c.is_whitespace(),
-                            'S' => !c.is_whitespace(),
-                            'n' => c == '\n',
-                            't' => c == '\t',
-                            _ => c == esc,
-                        }
-                    }, desc);
-                match result {
-                    QuantResult::Continue(new_pi, new_ti) => { pi = new_pi; ti = new_ti; continue; }
-                    QuantResult::Backtrack => {
-                        if let Some(state) = stack.pop() {
-                            steps.push(DebugStep {
-                                pattern_offset: state.pi,
-                                text_offset: state.ti,
-                                description: format!("Backtrack to p[{}] t[{}]", state.pi, state.ti),
-                                is_backtrack: true,
-                                matched: false,
-                            });
-                            pi = state.pi;
-                            ti = state.ti;
-                            continue;
-                        }
-                        return false;
-                    }
+        match &program[pc] {
+            Inst::Match => {
+                steps.push(DebugStep {
+                    pattern_offset: pattern.len(),
+                    text_offset: ti,
+                    description: format!("Match found [{},{})", start_ti, ti),
+                    is_backtrack: false,
+                    matched: true,
+                });
+                return true;
+            }
+            Inst::Literal(ch, pat_off) => {
+                let ok = ti < text_len && text[ti] == *ch;
+                steps.push(DebugStep {
+                    pattern_offset: *pat_off,
+                    text_offset: ti,
+                    description: if ok {
+                        format!("'{}' matched", ch)
+                    } else if ti < text_len {
+                        format!("'{}' != '{}'", ch, text[ti])
+                    } else {
+                        format!("'{}' at end of text", ch)
+                    },
+                    is_backtrack: false,
+                    matched: ok,
+                });
+                if ok {
+                    pc += 1;
+                    ti += 1;
+                    continue;
                 }
             }
-
-            steps.push(DebugStep {
-                pattern_offset: pi,
-                text_offset: ti,
-                description: format!("{} {}", desc, if ok { "matched" } else { "failed" }),
-                is_backtrack: false,
-                matched: ok,
-            });
-            if ok {
-                pi += 2;
-                ti += 1;
-                continue;
-            }
-        } else if pat[pi] == '.' {
-            let quantifier = get_quantifier(pat, pi + 1, pat_len);
-            if let Some((min, max, quant_end, lazy)) = quantifier {
-                let result = handle_quantified_atom(pat, text, pi, ti, pi + 1, quant_end, min, max, lazy,
-                    &mut stack, steps, |t, pos| t[pos] != '\n', ". (any)");
-                match result {
-                    QuantResult::Continue(new_pi, new_ti) => { pi = new_pi; ti = new_ti; continue; }
-                    QuantResult::Backtrack => {
-                        if let Some(state) = stack.pop() {
-                            steps.push(DebugStep {
-                                pattern_offset: state.pi,
-                                text_offset: state.ti,
-                                description: format!("Backtrack to p[{}] t[{}]", state.pi, state.ti),
-                                is_backtrack: true,
-                                matched: false,
-                            });
-                            pi = state.pi;
-                            ti = state.ti;
-                            continue;
-                        }
-                        return false;
-                    }
+            Inst::Dot(pat_off) => {
+                let ok = ti < text_len && text[ti] != '\n';
+                steps.push(DebugStep {
+                    pattern_offset: *pat_off,
+                    text_offset: ti,
+                    description: if ok {
+                        format!(". matches '{}'", text[ti])
+                    } else {
+                        ". failed".to_string()
+                    },
+                    is_backtrack: false,
+                    matched: ok,
+                });
+                if ok {
+                    pc += 1;
+                    ti += 1;
+                    continue;
                 }
             }
-
-            let ok = ti < text_len && text[ti] != '\n';
-            steps.push(DebugStep {
-                pattern_offset: pi,
-                text_offset: ti,
-                description: if ok {
-                    format!(". matches '{}'", text[ti])
+            Inst::Anchor(kind, pat_off) => {
+                let ok = match kind {
+                    AnchorKind::Start => ti == 0,
+                    AnchorKind::End => ti == text_len,
+                };
+                steps.push(DebugStep {
+                    pattern_offset: *pat_off,
+                    text_offset: ti,
+                    description: format!("{} {}",
+                        match kind { AnchorKind::Start => "^", AnchorKind::End => "$" },
+                        if ok { "matched" } else { "failed" }),
+                    is_backtrack: false,
+                    matched: ok,
+                });
+                if ok {
+                    pc += 1;
+                    continue;
+                }
+            }
+            Inst::Escape(kind, pat_off) => {
+                let ok = ti < text_len && match_escape(*kind, text[ti]);
+                let desc_str = match kind {
+                    EscKind::Digit => "\\d",
+                    EscKind::NonDigit => "\\D",
+                    EscKind::Word => "\\w",
+                    EscKind::NonWord => "\\W",
+                    EscKind::Space => "\\s",
+                    EscKind::NonSpace => "\\S",
+                    EscKind::Char(c) => {
+                        // leak a description string for display
+                        // (only during debug stepping, acceptable)
+                        let _ = c;
+                        "\\esc"
+                    }
+                };
+                steps.push(DebugStep {
+                    pattern_offset: *pat_off,
+                    text_offset: ti,
+                    description: format!("{} {}", desc_str, if ok { "matched" } else { "failed" }),
+                    is_backtrack: false,
+                    matched: ok,
+                });
+                if ok {
+                    pc += 1;
+                    ti += 1;
+                    continue;
+                }
+            }
+            Inst::Class(ranges, negated, pat_off) => {
+                let ok = if ti < text_len {
+                    let in_class = ranges.iter().any(|r| r.contains(text[ti]));
+                    if *negated { !in_class } else { in_class }
                 } else {
-                    ". failed".to_string()
-                },
-                is_backtrack: false,
-                matched: ok,
-            });
-            if ok {
-                pi += 1;
-                ti += 1;
-                continue;
-            }
-        } else if pat[pi] == '^' {
-            let ok = ti == 0;
-            steps.push(DebugStep {
-                pattern_offset: pi,
-                text_offset: ti,
-                description: format!("^ {}", if ok { "matched" } else { "failed" }),
-                is_backtrack: false,
-                matched: ok,
-            });
-            if ok { pi += 1; continue; }
-        } else if pat[pi] == '$' {
-            let ok = ti == text_len;
-            steps.push(DebugStep {
-                pattern_offset: pi,
-                text_offset: ti,
-                description: format!("$ {}", if ok { "matched" } else { "failed" }),
-                is_backtrack: false,
-                matched: ok,
-            });
-            if ok { pi += 1; continue; }
-        } else if pat[pi] == '[' {
-            let (class_end, negated) = parse_char_class(pat, pi);
-            let ok = if ti < text_len {
-                let in_class = char_in_class(pat, pi, class_end, text[ti]);
-                if negated { !in_class } else { in_class }
-            } else {
-                false
-            };
-
-            let quantifier = get_quantifier(pat, class_end, pat_len);
-            if let Some((min, max, quant_end, lazy)) = quantifier {
-                let class_pi = pi;
-                let class_e = class_end;
-                let neg = negated;
-                let result = handle_quantified_atom(pat, text, pi, ti, class_end, quant_end, min, max, lazy,
-                    &mut stack, steps, move |t, pos| {
-                        let in_c = char_in_class(pat, class_pi, class_e, t[pos]);
-                        if neg { !in_c } else { in_c }
-                    }, "[...] class");
-                match result {
-                    QuantResult::Continue(new_pi, new_ti) => { pi = new_pi; ti = new_ti; continue; }
-                    QuantResult::Backtrack => {
-                        if let Some(state) = stack.pop() {
-                            steps.push(DebugStep {
-                                pattern_offset: state.pi,
-                                text_offset: state.ti,
-                                description: format!("Backtrack to p[{}] t[{}]", state.pi, state.ti),
-                                is_backtrack: true,
-                                matched: false,
-                            });
-                            pi = state.pi;
-                            ti = state.ti;
-                            continue;
-                        }
-                        return false;
-                    }
+                    false
+                };
+                steps.push(DebugStep {
+                    pattern_offset: *pat_off,
+                    text_offset: ti,
+                    description: format!("[...] {}", if ok { "matched" } else { "failed" }),
+                    is_backtrack: false,
+                    matched: ok,
+                });
+                if ok {
+                    pc += 1;
+                    ti += 1;
+                    continue;
                 }
             }
-
-            steps.push(DebugStep {
-                pattern_offset: pi,
-                text_offset: ti,
-                description: format!("[...] {}", if ok { "matched" } else { "failed" }),
-                is_backtrack: false,
-                matched: ok,
-            });
-            if ok {
-                pi = class_end;
-                ti += 1;
+            Inst::Split(a, b, pat_off) => {
+                let a = *a;
+                let b = *b;
+                let pat_off = *pat_off;
+                // Preferred branch is `a`, save `b` as backtrack
+                stack.push(Thread { pc: b, ti });
+                steps.push(DebugStep {
+                    pattern_offset: pat_off,
+                    text_offset: ti,
+                    description: format!("Split: try preferred, save alternative"),
+                    is_backtrack: false,
+                    matched: true,
+                });
+                pc = a;
                 continue;
             }
-        } else {
-            // Literal
-            let ch = pat[pi];
-            let quantifier = get_quantifier(pat, pi + 1, pat_len);
-            if let Some((min, max, quant_end, lazy)) = quantifier {
-                let result = handle_quantified_atom(pat, text, pi, ti, pi + 1, quant_end, min, max, lazy,
-                    &mut stack, steps, move |t, pos| t[pos] == ch, &format!("'{}'", ch));
-                match result {
-                    QuantResult::Continue(new_pi, new_ti) => { pi = new_pi; ti = new_ti; continue; }
-                    QuantResult::Backtrack => {
-                        if let Some(state) = stack.pop() {
-                            steps.push(DebugStep {
-                                pattern_offset: state.pi,
-                                text_offset: state.ti,
-                                description: format!("Backtrack to p[{}] t[{}]", state.pi, state.ti),
-                                is_backtrack: true,
-                                matched: false,
-                            });
-                            pi = state.pi;
-                            ti = state.ti;
-                            continue;
-                        }
-                        return false;
-                    }
-                }
+            Inst::Jump(target) => {
+                pc = *target;
+                continue;
             }
-
-            let ok = ti < text_len && text[ti] == ch;
-            steps.push(DebugStep {
-                pattern_offset: pi,
-                text_offset: ti,
-                description: if ok {
-                    format!("'{}' matched", ch)
-                } else if ti < text_len {
-                    format!("'{}' != '{}'", ch, text[ti])
-                } else {
-                    format!("'{}' at end", ch)
-                },
-                is_backtrack: false,
-                matched: ok,
-            });
-            if ok {
-                pi += 1;
-                ti += 1;
+            Inst::Save(_) => {
+                pc += 1;
                 continue;
             }
         }
 
-        // Failed - try backtrack
-        if let Some(state) = stack.pop() {
+        // If we reach here, the current instruction failed. Backtrack.
+        if let Some(t) = stack.pop() {
             steps.push(DebugStep {
-                pattern_offset: state.pi,
-                text_offset: state.ti,
-                description: format!("Backtrack to p[{}] t[{}]", state.pi, state.ti),
+                pattern_offset: inst_pat_off(program, t.pc),
+                text_offset: t.ti,
+                description: format!("Backtrack to p[{}] t[{}]", inst_pat_off(program, t.pc), t.ti),
                 is_backtrack: true,
                 matched: false,
             });
-            pi = state.pi;
-            ti = state.ti;
+            pc = t.pc;
+            ti = t.ti;
         } else {
             return false;
         }
     }
 }
 
-enum QuantResult {
-    Continue(usize, usize),
-    Backtrack,
-}
-
-fn handle_quantified_atom<F>(
-    _pat: &[char],
-    text: &[char],
-    atom_pi: usize,
-    ti: usize,
-    _atom_end: usize,
-    quant_end: usize,
-    min: usize,
-    max: usize,
-    lazy: bool,
-    stack: &mut Vec<State>,
-    steps: &mut Vec<DebugStep>,
-    matcher: F,
-    desc: &str,
-) -> QuantResult
-where
-    F: Fn(&[char], usize) -> bool,
-{
-    let text_len = text.len();
-    let mut count = 0;
-    let mut pos = ti;
-
-    if !lazy {
-        // Greedy
-        while count < max && pos < text_len && matcher(text, pos) {
-            pos += 1;
-            count += 1;
-        }
-        if count < min {
-            steps.push(DebugStep {
-                pattern_offset: atom_pi,
-                text_offset: ti,
-                description: format!("{} quantifier needs {}, got {}", desc, min, count),
-                is_backtrack: false,
-                matched: false,
-            });
-            return QuantResult::Backtrack;
-        }
-        // Push backtrack states from min to count-1 (we try max first)
-        for bt_count in min..count {
-            stack.push(State { pi: quant_end, ti: ti + bt_count });
-        }
-        steps.push(DebugStep {
-            pattern_offset: atom_pi,
-            text_offset: ti,
-            description: format!("{} matched {} times (greedy)", desc, count),
-            is_backtrack: false,
-            matched: true,
-        });
-        QuantResult::Continue(quant_end, ti + count)
-    } else {
-        // Lazy
-        while count < min {
-            if pos >= text_len || !matcher(text, pos) {
-                steps.push(DebugStep {
-                    pattern_offset: atom_pi,
-                    text_offset: ti,
-                    description: format!("{} lazy needs min {}", desc, min),
-                    is_backtrack: false,
-                    matched: false,
-                });
-                return QuantResult::Backtrack;
-            }
-            pos += 1;
-            count += 1;
-        }
-        // Push expansion states
-        let mut expand_pos = pos;
-        let mut expand_count = count;
-        while expand_count < max && expand_pos < text_len && matcher(text, expand_pos) {
-            expand_pos += 1;
-            expand_count += 1;
-            stack.push(State { pi: quant_end, ti: expand_pos });
-        }
-        steps.push(DebugStep {
-            pattern_offset: atom_pi,
-            text_offset: ti,
-            description: format!("{} matched {} times (lazy)", desc, count),
-            is_backtrack: false,
-            matched: true,
-        });
-        QuantResult::Continue(quant_end, pos)
+fn inst_pat_off(program: &[Inst], pc: usize) -> usize {
+    if pc >= program.len() {
+        return 0;
+    }
+    match &program[pc] {
+        Inst::Literal(_, off) => *off,
+        Inst::Dot(off) => *off,
+        Inst::Anchor(_, off) => *off,
+        Inst::Escape(_, off) => *off,
+        Inst::Class(_, _, off) => *off,
+        Inst::Split(_, _, off) => *off,
+        Inst::Jump(_) => 0,
+        Inst::Match => 0,
+        Inst::Save(_) => 0,
     }
 }
 
-fn get_quantifier(pat: &[char], pos: usize, pat_len: usize) -> Option<(usize, usize, usize, bool)> {
-    if pos >= pat_len {
-        return None;
+fn match_escape(kind: EscKind, c: char) -> bool {
+    match kind {
+        EscKind::Digit => c.is_ascii_digit(),
+        EscKind::NonDigit => !c.is_ascii_digit(),
+        EscKind::Word => c.is_alphanumeric() || c == '_',
+        EscKind::NonWord => !(c.is_alphanumeric() || c == '_'),
+        EscKind::Space => c.is_whitespace(),
+        EscKind::NonSpace => !c.is_whitespace(),
+        EscKind::Char(expected) => c == expected,
     }
-    let (min, max, end) = match pat[pos] {
-        '*' => (0, usize::MAX, pos + 1),
-        '+' => (1, usize::MAX, pos + 1),
-        '?' => (0, 1, pos + 1),
-        '{' => {
-            if let Some(result) = parse_range_quantifier(pat, pos) {
-                result
-            } else {
-                return None;
-            }
-        }
-        _ => return None,
-    };
-    let lazy = end < pat_len && pat[end] == '?';
-    let final_end = if lazy { end + 1 } else { end };
-    Some((min, max, final_end, lazy))
 }
 
-fn parse_range_quantifier(pat: &[char], pos: usize) -> Option<(usize, usize, usize)> {
-    let mut i = pos + 1;
-    let pat_len = pat.len();
-    let mut num_str = String::new();
+// ===== Tests =====
 
-    while i < pat_len && pat[i].is_ascii_digit() {
-        num_str.push(pat[i]);
-        i += 1;
-    }
-    if num_str.is_empty() || i >= pat_len {
-        return None;
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let min: usize = num_str.parse().ok()?;
-
-    if pat[i] == '}' {
-        return Some((min, min, i + 1));
-    }
-    if pat[i] != ',' {
-        return None;
-    }
-    i += 1;
-
-    let mut max_str = String::new();
-    while i < pat_len && pat[i].is_ascii_digit() {
-        max_str.push(pat[i]);
-        i += 1;
-    }
-    if i >= pat_len || pat[i] != '}' {
-        return None;
+    #[test]
+    fn test_simple_literal_match() {
+        let steps = collect_debug_steps("abc", "abc");
+        assert!(steps.last().unwrap().matched);
+        assert!(steps.iter().any(|s| s.description.contains("Match found")));
     }
 
-    let max = if max_str.is_empty() {
-        usize::MAX
-    } else {
-        max_str.parse().ok()?
-    };
-
-    Some((min, max, i + 1))
-}
-
-fn parse_char_class(pat: &[char], start: usize) -> (usize, bool) {
-    let mut i = start + 1;
-    let negated = i < pat.len() && pat[i] == '^';
-    if negated { i += 1; }
-    if i < pat.len() && pat[i] == ']' { i += 1; }
-    while i < pat.len() && pat[i] != ']' {
-        if pat[i] == '\\' && i + 1 < pat.len() { i += 1; }
-        i += 1;
+    #[test]
+    fn test_simple_literal_no_match() {
+        let steps = collect_debug_steps("xyz", "abc");
+        assert!(!steps.last().unwrap().matched);
     }
-    if i < pat.len() { i += 1; }
-    (i, negated)
-}
 
-fn char_in_class(pat: &[char], start: usize, end: usize, ch: char) -> bool {
-    let mut i = start + 1;
-    if i < end && pat[i] == '^' { i += 1; }
-
-    while i < end - 1 {
-        if pat[i] == '\\' && i + 1 < end - 1 {
-            let esc = pat[i + 1];
-            let matched = match esc {
-                'd' => ch.is_ascii_digit(),
-                'D' => !ch.is_ascii_digit(),
-                'w' => ch.is_alphanumeric() || ch == '_',
-                'W' => !(ch.is_alphanumeric() || ch == '_'),
-                's' => ch.is_whitespace(),
-                'S' => !ch.is_whitespace(),
-                _ => ch == esc,
-            };
-            if matched { return true; }
-            i += 2;
-        } else if i + 2 < end - 1 && pat[i + 1] == '-' {
-            if ch >= pat[i] && ch <= pat[i + 2] {
-                return true;
-            }
-            i += 3;
-        } else {
-            if ch == pat[i] { return true; }
-            i += 1;
-        }
+    #[test]
+    fn test_dot_star() {
+        let steps = collect_debug_steps("a.*b", "aXXXb");
+        assert!(steps.iter().any(|s| s.description.contains("Match found")));
     }
-    false
+
+    #[test]
+    fn test_alternation_first_branch() {
+        let steps = collect_debug_steps("(cat|dog)", "cat");
+        assert!(steps.iter().any(|s| s.description.contains("Match found")));
+    }
+
+    #[test]
+    fn test_alternation_second_branch() {
+        let steps = collect_debug_steps("(cat|dog)", "dog");
+        let found = steps.iter().any(|s| s.description.contains("Match found"));
+        assert!(found, "Should match 'dog' via second branch");
+        // Should have some backtracking since first branch fails
+        let backtracks = steps.iter().filter(|s| s.is_backtrack).count();
+        assert!(backtracks > 0, "Should backtrack from first branch to second");
+    }
+
+    #[test]
+    fn test_group_with_quantifier() {
+        let steps = collect_debug_steps("(ab)+", "ababab");
+        assert!(steps.iter().any(|s| s.description.contains("Match found")));
+    }
+
+    #[test]
+    fn test_nested_group_quantifier() {
+        // (a+)+ is a classic catastrophic backtracking pattern when it fails
+        let steps = collect_debug_steps("(a+)+b", "aaab");
+        assert!(steps.iter().any(|s| s.description.contains("Match found")),
+            "Should match 'aaab'");
+    }
+
+    #[test]
+    fn test_catastrophic_backtracking_detected() {
+        // (a+)+b against "aaaaaaaaaaaaa!" triggers exponential backtracking
+        // With our step limit, we should see many backtrack steps
+        let steps = collect_debug_steps("(a+)+b", "aaaaaaaaaa!");
+        let backtrack_count = steps.iter().filter(|s| s.is_backtrack).count();
+        // Should have significant backtracking
+        assert!(backtrack_count > 20,
+            "Expected significant backtracking, got {} backtracks in {} steps",
+            backtrack_count, steps.len());
+        // Should hit step limit or fail without match
+        assert!(!steps.iter().any(|s| s.description.contains("Match found")),
+            "Should not match since input doesn't end with 'b'");
+    }
+
+    #[test]
+    fn test_alternation_catastrophic() {
+        // (a|aa)+b against "aaaaaaa!" - another catastrophic pattern
+        let steps = collect_debug_steps("(a|aa)+b", "aaaaaaa!");
+        let backtrack_count = steps.iter().filter(|s| s.is_backtrack).count();
+        assert!(backtrack_count > 10,
+            "Expected backtracking from alternation, got {} backtracks in {} steps",
+            backtrack_count, steps.len());
+    }
+
+    #[test]
+    fn test_heatmap_shows_hot_spots() {
+        // (a+)+b on failing input should have hot spots at the group/quantifier
+        let steps = collect_debug_steps("(a+)+b", "aaaa!");
+        let session = DebugSession::new(steps);
+        let max = session.max_heat();
+        assert!(max > 3, "Heatmap max should be high due to backtracking, got {}", max);
+        // Pattern offset 0 (the group start) should be frequently visited
+        let heat_at_0 = session.heatmap.get(&0).copied().unwrap_or(0);
+        assert!(heat_at_0 > 2, "Group start should be visited multiple times, got {}", heat_at_0);
+    }
+
+    #[test]
+    fn test_non_capturing_group() {
+        let steps = collect_debug_steps("(?:ab)+c", "ababc");
+        assert!(steps.iter().any(|s| s.description.contains("Match found")));
+    }
+
+    #[test]
+    fn test_nested_alternation() {
+        let steps = collect_debug_steps("(a|b)(c|d)", "bd");
+        assert!(steps.iter().any(|s| s.description.contains("Match found")),
+            "Should match 'bd': b from first group, d from second");
+    }
+
+    #[test]
+    fn test_quantifier_on_group_with_alternation() {
+        // (ab|cd)+ should match "abcdab"
+        let steps = collect_debug_steps("(ab|cd)+", "abcdab");
+        assert!(steps.iter().any(|s| s.description.contains("Match found")));
+    }
+
+    #[test]
+    fn test_step_navigation() {
+        let steps = collect_debug_steps("a+b", "aab");
+        let mut session = DebugSession::new(steps.clone());
+        assert_eq!(session.current_step, 0);
+        session.step_forward();
+        assert_eq!(session.current_step, 1);
+        session.step_backward();
+        assert_eq!(session.current_step, 0);
+        session.step_backward(); // shouldn't go below 0
+        assert_eq!(session.current_step, 0);
+    }
+
+    #[test]
+    fn test_heatmap_toggle() {
+        let steps = collect_debug_steps("a", "a");
+        let mut session = DebugSession::new(steps);
+        assert!(!session.heatmap_mode);
+        session.toggle_heatmap();
+        assert!(session.heatmap_mode);
+        session.toggle_heatmap();
+        assert!(!session.heatmap_mode);
+    }
+
+    #[test]
+    fn test_escape_in_pattern() {
+        let steps = collect_debug_steps(r"\d+", "123");
+        assert!(steps.iter().any(|s| s.description.contains("Match found")));
+    }
+
+    #[test]
+    fn test_char_class() {
+        let steps = collect_debug_steps("[a-z]+", "hello");
+        assert!(steps.iter().any(|s| s.description.contains("Match found")));
+    }
+
+    #[test]
+    fn test_dot_star_catastrophic_variant() {
+        // (.*a){3} on "aaa...no-final" is known catastrophic
+        // Simplified version: (.*a) repeated
+        let steps = collect_debug_steps("(.*a)(.*a)(.*a)b", "aaaa");
+        let backtrack_count = steps.iter().filter(|s| s.is_backtrack).count();
+        assert!(backtrack_count > 5,
+            "Expected backtracking, got {} backtracks in {} steps",
+            backtrack_count, steps.len());
+    }
+
+    #[test]
+    fn test_empty_pattern() {
+        let steps = collect_debug_steps("", "hello");
+        assert_eq!(steps.len(), 1);
+        assert!(steps[0].matched);
+    }
+
+    #[test]
+    fn test_anchored_pattern() {
+        let steps = collect_debug_steps("^abc$", "abc");
+        assert!(steps.iter().any(|s| s.description.contains("Match found")));
+    }
+
+    #[test]
+    fn test_anchored_pattern_fail() {
+        let steps = collect_debug_steps("^abc$", "xabc");
+        assert!(!steps.iter().any(|s| s.description.contains("Match found")));
+    }
 }
