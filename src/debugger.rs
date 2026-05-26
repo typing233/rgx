@@ -130,33 +130,7 @@ impl Compiler {
     }
 
     fn compile_alternation(&mut self) {
-        let start = self.insts.len();
-        self.compile_concat();
-
-        while self.pos < self.pattern.len() && self.pattern[self.pos] == '|' {
-            let pat_off = self.pos;
-            self.pos += 1; // skip '|'
-            let jmp_hole = self.insts.len();
-            self.insts.push(Inst::Jump(0)); // placeholder
-
-            let alt_start = self.insts.len();
-            // patch the previous start to be a Split
-            let old_start_inst = self.insts[start].clone();
-            // We need to insert a Split before the first branch.
-            // Strategy: wrap using a new split approach
-            // Actually let's use a simpler approach: patch after
-            self.compile_concat();
-
-            let after = self.insts.len();
-            // patch jump
-            self.insts[jmp_hole] = Inst::Jump(after);
-
-            // We need to insert a Split at `start`. Shift everything.
-            // For simplicity, let's use a different approach for alternation:
-            // rebuild using Split chains
-            let _ = (old_start_inst, alt_start, pat_off);
-            // Actually this is getting complex. Let me use a different compilation strategy.
-        }
+        self.compile_alternation_full(0);
     }
 
     fn compile_concat(&mut self) {
@@ -255,118 +229,86 @@ impl Compiler {
     }
 
     fn compile_alternation_full(&mut self, group_pat_off: usize) {
-        // Compile alternation inside a group with proper Split/Jump chains
-        let mut branch_starts = Vec::new();
-        let mut jump_holes = Vec::new();
+        // Compile each branch into a separate Vec<Inst>, then assemble with Splits.
+        let base = self.insts.len();
 
-        branch_starts.push(self.insts.len());
+        // Collect branches: compile into self.insts temporarily, then extract.
+        let mut branches: Vec<Vec<Inst>> = Vec::new();
+
+        let branch_start = self.insts.len();
         self.compile_concat();
+        let first: Vec<Inst> = self.insts.drain(branch_start..).collect();
+        branches.push(first);
 
         while self.pos < self.pattern.len() && self.pattern[self.pos] == '|' {
-            self.pos += 1;
-            jump_holes.push(self.insts.len());
-            self.insts.push(Inst::Jump(0)); // placeholder: jump past all alternatives
-            branch_starts.push(self.insts.len());
+            self.pos += 1; // skip '|'
+            let bs = self.insts.len();
             self.compile_concat();
+            let branch: Vec<Inst> = self.insts.drain(bs..).collect();
+            branches.push(branch);
         }
 
-        let after = self.insts.len();
-        // Patch all jump holes
-        for hole in &jump_holes {
-            self.insts[*hole] = Inst::Jump(after);
+        let n = branches.len();
+        if n == 1 {
+            for inst in branches.into_iter().next().unwrap() {
+                self.insts.push(inst);
+            }
+            return;
         }
 
-        // Now insert Split instructions to wire up the alternatives
-        if branch_starts.len() > 1 {
-            // We need to restructure: insert Splits at the beginning
-            // Easiest: rebuild with a wrapper
-            // Strategy: build a chain of Splits
-            let mut new_insts = Vec::new();
-            let original = std::mem::take(&mut self.insts);
+        // Layout for N branches:
+        //   [N-1 Split insts] [Branch0 code] [Jump] [Branch1 code] [Jump] ... [BranchN-1 code]
+        //
+        // All addresses are absolute (index into self.insts).
 
-            // For N branches, we need N-1 Split instructions prepended
-            // Split chain: Split(branch0_start, next_split) -> Split(branch1_start, next_split) -> ... -> last_branch
-            // But since we already have the instructions inline, we need a different approach.
-            //
-            // Alternative: work with the instruction list as-is, using a single compile pass.
-            // Let's use a "retry" design that's simpler for the interpreter.
+        let num_splits = n - 1;
 
-            // Actually, let's just re-do this with a recursive split chain approach.
-            // For alternation `a|b|c`, we emit:
-            //   Split(L1, L_split2)
-            //   L1: <code for a> Jump(End)
-            //   L_split2: Split(L2, L3)
-            //   L2: <code for b> Jump(End)
-            //   L3: <code for c>
-            //   End: ...
-
-            // Since we already compiled inline, let's identify the boundaries and restructure.
-            // branch_starts[i] = start of instructions for branch i
-            // jump_holes[i-1]+1 = start of instructions for branch i (for i>0)
-            // The code between branch_starts[i] and (jump_holes[i] or original.len()) is branch i
-
-            let num_branches = branch_starts.len();
-            let mut branch_code: Vec<Vec<Inst>> = Vec::new();
-            for i in 0..num_branches {
-                let start = branch_starts[i];
-                let end = if i < jump_holes.len() {
-                    jump_holes[i] // the Jump instruction itself
-                } else {
-                    original.len()
-                };
-                branch_code.push(original[start..end].to_vec());
+        // Calculate branch code offset (where each branch's code starts)
+        let code_area_start = base + num_splits;
+        let mut branch_abs_start = Vec::new();
+        let mut cursor = code_area_start;
+        for (i, branch) in branches.iter().enumerate() {
+            branch_abs_start.push(cursor);
+            cursor += branch.len();
+            if i < n - 1 {
+                cursor += 1; // for the Jump instruction after each non-last branch
             }
+        }
+        let end_pc = cursor;
 
-            // Now emit Split chain
-            // First, calculate total sizes to assign proper targets
-            // Layout: [SplitChain] [Branch0 code + Jump] [Branch1 code + Jump] ... [BranchN code]
-            let split_chain_len = num_branches - 1;
-            let mut branch_offsets = Vec::new();
-            let mut offset = split_chain_len; // splits come first
-            for (i, code) in branch_code.iter().enumerate() {
-                branch_offsets.push(offset);
-                offset += code.len();
-                if i < num_branches - 1 {
-                    offset += 1; // Jump instruction
-                }
+        // Emit the Split chain
+        for i in 0..num_splits {
+            let prefer = branch_abs_start[i];
+            let alt = if i + 1 < num_splits {
+                base + i + 1 // next Split in the chain
+            } else {
+                branch_abs_start[n - 1] // last branch directly
+            };
+            self.insts.push(Inst::Split(prefer, alt, group_pat_off));
+        }
+
+        // Emit branch code, each (except last) followed by Jump(end_pc)
+        for (i, branch) in branches.into_iter().enumerate() {
+            // Branch was compiled with self.insts starting at `base`, so any internal
+            // Jump/Split targets are absolute indices starting from `base`. We need to
+            // shift them to their new absolute position: branch_abs_start[i] - base.
+            let reloc = branch_abs_start[i] - base;
+            for inst in branch {
+                self.insts.push(Self::relocate_inst(inst, reloc));
             }
-            let total_len = offset;
-
-            // Emit splits
-            for i in 0..(num_branches - 1) {
-                let left = branch_offsets[i];
-                let right = if i + 1 < num_branches - 1 {
-                    i + 1 // next split
-                } else {
-                    branch_offsets[i + 1] // last branch directly
-                };
-                new_insts.push(Inst::Split(left, right, group_pat_off));
+            if i < n - 1 {
+                self.insts.push(Inst::Jump(end_pc));
             }
-
-            // Emit branch code with Jumps
-            for (i, code) in branch_code.iter().enumerate() {
-                for inst in code {
-                    new_insts.push(Self::offset_inst(inst.clone(), 0)); // no offset needed, already correct? No - addresses are wrong
-                }
-                if i < num_branches - 1 {
-                    new_insts.push(Inst::Jump(total_len));
-                }
-            }
-
-            // Now fix all addresses in branch code - they were compiled with offsets relative to the original vec
-            // We need to recompile. This approach is getting too complex for inline patching.
-            //
-            // Let me use a MUCH simpler approach: instead of compiling to a VM,
-            // use a recursive interpreter on a parsed AST representation.
-
-            // For now, just put back original and we'll use the recursive interpreter approach.
-            self.insts = original;
-            // Splits won't be used - the recursive interpreter handles alternation directly.
         }
     }
 
-    fn offset_inst(inst: Inst, _offset: usize) -> Inst {
-        inst // placeholder
+    fn relocate_inst(inst: Inst, delta: usize) -> Inst {
+        // Shift absolute pc references (Split targets, Jump targets) by `delta`.
+        match inst {
+            Inst::Split(a, b, off) => Inst::Split(a + delta, b + delta, off),
+            Inst::Jump(target) => Inst::Jump(target + delta),
+            other => other,
+        }
     }
 
     fn apply_quantifier(&mut self, atom_start: usize, atom_end: usize, pat_off: usize, quant: char, lazy: bool) {
@@ -1026,5 +968,87 @@ mod tests {
     fn test_anchored_pattern_fail() {
         let steps = collect_debug_steps("^abc$", "xabc");
         assert!(!steps.iter().any(|s| s.description.contains("Match found")));
+    }
+
+    #[test]
+    fn test_three_branch_alternation() {
+        // (a|b|c) should match each of a, b, c
+        let steps_a = collect_debug_steps("(a|b|c)", "a");
+        assert!(steps_a.iter().any(|s| s.description.contains("Match found")));
+
+        let steps_b = collect_debug_steps("(a|b|c)", "b");
+        assert!(steps_b.iter().any(|s| s.description.contains("Match found")));
+
+        let steps_c = collect_debug_steps("(a|b|c)", "c");
+        assert!(steps_c.iter().any(|s| s.description.contains("Match found")));
+    }
+
+    #[test]
+    fn test_alternation_with_quantifier_on_group() {
+        // (ab|cd)+ against "abab" should match
+        let steps = collect_debug_steps("(ab|cd)+", "abab");
+        assert!(steps.iter().any(|s| s.description.contains("Match found")));
+
+        // (ab|cd)+ against "cdab" should match
+        let steps2 = collect_debug_steps("(ab|cd)+", "cdab");
+        assert!(steps2.iter().any(|s| s.description.contains("Match found")));
+    }
+
+    #[test]
+    fn test_catastrophic_nested_quantifiers() {
+        // (a*)*b is a classic evil regex - causes excessive steps
+        let steps = collect_debug_steps("(a*)*b", "aaaa!");
+        // Should hit the step limit or produce many steps due to the nested loop
+        assert!(steps.len() > 100,
+            "Nested quantifiers should cause excessive steps, got {} steps",
+            steps.len());
+        assert!(!steps.iter().any(|s| s.description.contains("Match found")));
+    }
+
+    #[test]
+    fn test_catastrophic_shows_in_heatmap() {
+        // (a+)+b against "aaaaaa!" should show high heat at group positions
+        let steps = collect_debug_steps("(a+)+b", "aaaaaa!");
+        let session = DebugSession::new(steps);
+        // In catastrophic backtracking, pattern positions are visited many times
+        assert!(session.max_heat() > 5,
+            "Heatmap should show high repetition, max_heat = {}", session.max_heat());
+        // Total steps should be significantly more than the text length
+        assert!(session.total_steps() > 30,
+            "Should have many steps due to backtracking, got {}", session.total_steps());
+    }
+
+    #[test]
+    fn test_alternation_within_quantified_group_catastrophic() {
+        // (a|a)+b - exponential because both branches consume same char
+        let steps = collect_debug_steps("(a|a)+b", "aaaaaaa!");
+        let backtrack_count = steps.iter().filter(|s| s.is_backtrack).count();
+        assert!(backtrack_count > 20,
+            "Expected heavy backtracking from (a|a)+, got {} backtracks in {} steps",
+            backtrack_count, steps.len());
+    }
+
+    #[test]
+    fn test_group_match_succeeds() {
+        // (foo)(bar) against "foobar" should match
+        let steps = collect_debug_steps("(foo)(bar)", "foobar");
+        assert!(steps.iter().any(|s| s.description.contains("Match found")));
+    }
+
+    #[test]
+    fn test_optional_group() {
+        // (a)?b should match both "ab" and "b"
+        let steps_ab = collect_debug_steps("(a)?b", "ab");
+        assert!(steps_ab.iter().any(|s| s.description.contains("Match found")));
+
+        let steps_b = collect_debug_steps("(a)?b", "b");
+        assert!(steps_b.iter().any(|s| s.description.contains("Match found")));
+    }
+
+    #[test]
+    fn test_deeply_nested_groups() {
+        // ((a+)b)+ against "abaab" should match
+        let steps = collect_debug_steps("((a+)b)+", "abaab");
+        assert!(steps.iter().any(|s| s.description.contains("Match found")));
     }
 }
